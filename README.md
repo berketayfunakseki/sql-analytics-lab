@@ -1,70 +1,91 @@
-"""
-dashboard.py — visualizes the SQL analysis results.
-The SQL does the real work; this just renders it so a recruiter can see
-the output without running Python themselves.
-"""
-import streamlit as st
-import matplotlib.pyplot as plt
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.run_queries import run_all
+# SQL Analytics Lab — Cohort Retention, Funnel, and Growth Metrics
 
-st.set_page_config(page_title="SQL Analytics Lab", layout="wide")
-st.title("📊 SQL Analytics Lab")
-st.caption("Cohort retention, funnel conversion, and growth metrics — computed entirely in SQL (window functions, CTEs) against a synthetic app-usage dataset.")
+Product-analytics SQL against a synthetic app-usage dataset: funnel conversion,
+weekly cohort retention, growth curves, and country-level ranking — the exact
+question shapes that come up in DS/analytics SQL interviews ("compute N-week
+retention by cohort", "rank X by Y with ties handled correctly").
 
-try:
-    results = run_all()
-except FileNotFoundError:
-    st.error("Database not found. Run `python src/generate_data.py` first.")
-    st.stop()
+All analysis is in raw SQL (`sql/*.sql`) using window functions and CTEs —
+no ORM, no pandas groupby standing in for what SQL should do.
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔻 Funnel", "📅 Cohort Retention", "📈 Growth", "🌍 Country Ranking"])
+## What's inside
 
-with tab1:
-    st.subheader("Signup → Subscribed funnel")
-    df = results["funnel_conversion"]
-    st.dataframe(df, use_container_width=True)
+| File | Technique |
+|---|---|
+| `sql/funnel_conversion.sql` | `LAG()`, `FIRST_VALUE()` — step-over-step and overall funnel conversion |
+| `sql/cohort_retention.sql` | Multi-CTE cohort analysis — weekly retention by signup cohort |
+| `sql/growth_and_ranking.sql` | Running totals (`SUM() OVER`), rolling averages, `RANK()` vs `DENSE_RANK()` |
+| `src/generate_data.py` | Builds a realistic synthetic `users` + `events` dataset into SQLite |
+| `src/run_queries.py` | Executes every `.sql` file and prints results — also acts as a smoke test |
+| `dashboard.py` | Streamlit app visualizing all of the above |
 
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.bar(df["funnel_step"], df["users_reached"], color="#00C299")
-    for i, row in df.iterrows():
-        ax.text(i, row["users_reached"], f"{row['overall_conversion_from_signup_pct']}%", ha="center", va="bottom")
-    ax.set_ylabel("Users reached")
-    ax.set_title("Funnel drop-off (% = conversion from signup)")
-    st.pyplot(fig)
+## Running locally
 
-    biggest_drop = df.loc[df["step_over_step_conversion_pct"].idxmin()]
-    st.info(f"**Biggest drop-off:** into *{biggest_drop['funnel_step']}* "
-            f"({biggest_drop['step_over_step_conversion_pct']}% of the previous step made it through) — "
-            f"this is where product investment would have the highest leverage.")
+```bash
+pip install -r requirements.txt
 
-with tab2:
-    st.subheader("Weekly retention by signup cohort")
-    df = results["cohort_retention"]
-    pivot = df.pivot(index="cohort_week", columns="week_number", values="retention_pct")
-    st.dataframe(pivot.style.background_gradient(cmap="Greens", axis=None), use_container_width=True)
-    st.caption("Rows = signup cohort (week). Columns = weeks since signup. Cell = % of that cohort active in that week.")
+# generate the synthetic database
+python src/generate_data.py
 
-with tab3:
-    st.subheader("Cumulative signups & rolling average")
-    df = results["growth_and_ranking_part1"]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax2 = ax.twinx()
-    ax.bar(df["signup_date"], df["new_signups"], alpha=0.3, label="Daily signups", color="#22D3EE")
-    ax2.plot(df["signup_date"], df["cumulative_signups"], color="#00C299", label="Cumulative")
-    ax.set_xticks(df["signup_date"][::20])
-    ax.set_xticklabels(df["signup_date"][::20], rotation=45, ha="right")
-    ax.set_ylabel("Daily signups"); ax2.set_ylabel("Cumulative signups")
-    fig.legend(loc="upper left", bbox_to_anchor=(0.1, 0.9))
-    st.pyplot(fig)
+# run every SQL file and print results
+python src/run_queries.py
 
-with tab4:
-    st.subheader("Pro-plan conversion by country")
-    df = results["growth_and_ranking_part2"]
-    st.dataframe(df, use_container_width=True)
-    st.caption("`rank_with_gaps` (RANK) vs `dense_rank_no_gaps` (DENSE_RANK) — note how tied countries (DE/IT) "
-               "cause RANK to skip a position while DENSE_RANK doesn't.")
+# or view it in the dashboard
+streamlit run dashboard.py
+```
 
-st.divider()
-st.caption("Berke Tayfun Akseki — [berketayfunakseki.com](https://berketayfunakseki.com)")
+## Running with Docker
+
+```bash
+docker build -t sql-analytics-lab .
+docker run -p 8501:8501 sql-analytics-lab
+```
+
+## Schema
+
+```
+users(user_id, signup_date, country, plan)
+events(user_id, event_name, event_time)
+  event_name ∈ {signup, onboarding_complete, first_action, activated, subscribed, session}
+```
+
+`session` events represent repeat usage after the initial funnel — used for retention analysis.
+
+## Sample insight the funnel query surfaces
+
+The steepest drop-off in the simulated funnel is between `first_action` and `activated`
+(~55% loss) — steeper than the earlier `signup → onboarding_complete` step. In a real
+product this is exactly the kind of finding that redirects a roadmap: it says the
+biggest lever isn't onboarding UX, it's whatever happens right after a user's first action.
+
+## Why these choices
+
+- **`LAG()` over a self-join for funnel drop-off** — a self-join to compare each step to
+  the previous one works, but scales poorly and reads worse. `LAG()` is the idiomatic tool
+  for "compare this row to the previous row" and every modern SQL engine optimises it well.
+- **Explicit `CASE`-based step ordering, not alphabetical** — funnel steps have a real
+  business sequence that doesn't match alphabetical order; hardcoding the sequence prevents
+  a silent, hard-to-notice bug.
+- **Retention gated by funnel depth, not just full activation** — early data generation
+  attempts tied all retention to fully-activated users only, which produced unrealistically
+  low retention numbers. Real users return at every funnel depth, just at different rates.
+
+## Lessons learned
+
+- **My first comment-stripping logic in `run_queries.py` silently dropped every query** —
+  it checked whether an entire multi-line SQL statement *started* with `--`, which was always
+  true since each statement opens with a comment header. Fixed by stripping comment lines
+  before splitting on statement boundaries, not filtering whole statements.
+- **Synthetic retention data needs care to look realistic** — gating all repeat-session
+  generation behind one narrow user segment (only "activated" users) produced retention
+  numbers far below real-world benchmarks. Tiering the retention probability by funnel depth
+  fixed it and, as a side effect, made the funnel-vs-retention story more coherent.
+
+## What I'd improve next
+
+- Materialize the cohort/funnel queries as scheduled dbt models instead of ad-hoc scripts
+- Add a `LEFT JOIN` version of the funnel query to show step-by-step *drop* (not just conversion)
+- Postgres-specific window function variants (e.g. `PERCENT_RANK`) — this project uses SQLite for portability
+
+---
+Berke Tayfun Akseki — [berketayfunakseki.com](https://berketayfunakseki.com)
